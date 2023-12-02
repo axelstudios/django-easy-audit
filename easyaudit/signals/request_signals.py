@@ -1,17 +1,19 @@
+import base64
+import json
+import re
+import zlib
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.sessions.models import Session
 from django.core.signals import request_started
-from django.http.cookie import SimpleCookie
+from django.http.cookie import parse_cookie
 from django.utils import timezone
-from django.conf import settings
 from django.utils.module_loading import import_string
 
 # try and get the user from the request; commented for now, may have a bug in this flow.
 # from easyaudit.middleware.easyaudit import get_current_user
 from easyaudit.settings import REMOTE_ADDR_HEADER, UNREGISTERED_URLS, REGISTERED_URLS, WATCH_REQUEST_EVENTS, \
     LOGGING_BACKEND
-
-import re
 
 audit_logger = import_string(LOGGING_BACKEND)()
 
@@ -63,22 +65,36 @@ def request_started_handler(sender, **kwargs):
     user = None
     # get the user from cookies
     if not user and cookie_string:
-        cookie = SimpleCookie()
-        cookie.load(cookie_string)
+        cookie = parse_cookie(cookie_string)
         session_cookie_name = settings.SESSION_COOKIE_NAME
         if session_cookie_name in cookie:
-            session_id = cookie[session_cookie_name].value
+            session_id = cookie[session_cookie_name]
 
-            try:
-                session = Session.objects.get(session_key=session_id)
-            except Session.DoesNotExist:
-                session = None
-
-            if session:
-                user_id = session.get_decoded().get('_auth_user_id')
+            if settings.SESSION_ENGINE == 'django.contrib.sessions.backends.db':
                 try:
+                    session = Session.objects.get(session_key=session_id)
+                except Session.DoesNotExist:
+                    session = None
+
+                if session:
+                    user_id = session.get_decoded().get('_auth_user_id')
+                    try:
+                        user = get_user_model().objects.get(id=user_id)
+                    except:
+                        user = None
+
+            elif settings.SESSION_ENGINE == 'django.contrib.sessions.backends.signed_cookies':
+                try:
+                    payload = json.loads(zlib.decompress(base64.urlsafe_b64decode(session_id)))
+                    user_id = int(payload['_auth_user_id'])
+                    hash = payload['_auth_user_hash']
+                    # Confirm hash to verify user
                     user = get_user_model().objects.get(id=user_id)
+                    stored_hash = user.get_session_auth_hash()
+                    if hash != stored_hash:
+                        user = None
                 except:
+                    session = None
                     user = None
 
 
